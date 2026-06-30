@@ -1,0 +1,11 @@
+../Core/Src/motor.c:8:13:right_motor_forward	1
+../Core/Src/motor.c:14:13:left_motor_forward	1
+../Core/Src/motor.c:20:13:right_motor_backward	1
+../Core/Src/motor.c:26:13:left_motor_backward	1
+../Core/Src/motor.c:32:13:set_speed	1
+../Core/Src/motor.c:40:6:Motor_Init	1
+../Core/Src/motor.c:46:6:Car_Forward	1
+../Core/Src/motor.c:53:6:Car_Backward	1
+../Core/Src/motor.c:60:6:Car_Right	1
+../Core/Src/motor.c:67:6:Car_Left	1
+../Core/Src/motor.c:74:6:Car_Stop	1
