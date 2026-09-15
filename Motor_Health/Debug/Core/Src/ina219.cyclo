@@ -1,0 +1,4 @@
+../Core/Src/ina219.c:10:6:INA219_Init	1
+../Core/Src/ina219.c:19:7:INA219_ReadVoltage	1
+../Core/Src/ina219.c:28:7:INA219_ReadCurrent	1
+../Core/Src/ina219.c:36:7:INA219_ReadPower	1
