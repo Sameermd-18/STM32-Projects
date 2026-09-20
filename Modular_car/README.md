@@ -1,6 +1,6 @@
 # STM32 Bluetooth-Controlled Modular Car
 
-A modular differential-drive robotic car controlled wirelessly through a Bluetooth serial connection. The project uses an STM32F103RB to receive commands through USART1 and control two DC motors using GPIO direction signals and dual-channel PWM.
+A modular differential-drive robotic car controlled wirelessly through a Bluetooth serial connection. The project uses an STM32F103RB to receive commands through USART1 and control four DC motors arranged as left-side and right-side pairs using GPIO direction signals and dual-channel PWM.
 
 The firmware separates Bluetooth command handling from motor control, making the project easier to understand, test, and extend.
 
@@ -9,7 +9,8 @@ The firmware separates Bluetooth command handling from motor control, making the
 - STM32F103RB-based motor controller
 - Wireless command input through a Bluetooth UART module
 - Interrupt-driven, one-byte-at-a-time UART reception
-- Independent left- and right-motor direction control
+- Four-motor differential drive with two motors connected as each side group
+- Independent left- and right-side motor-pair direction control
 - TIM3 PWM speed control on two channels
 - Forward, backward, left, right, and stop motor-control functions
 - Small command buffer with newline-based command processing
@@ -34,15 +35,15 @@ Phone / Bluetooth controller
      |              |
      +---- Motor driver ----+
               |             |
-         Right motor    Left motor
+      Two right motors  Two left motors
 ```
 
 ## Hardware
 
 - STM32F103RB microcontroller or compatible development board
 - Bluetooth UART module such as the HC-05
-- Two DC geared motors
-- Dual H-bridge motor driver suitable for the selected motors
+- Four DC geared motors: two on the left side and two on the right side
+- Dual H-bridge motor driver suitable for driving two motors per channel
 - Robot chassis and wheels
 - Motor power supply
 - Jumper wires
@@ -56,12 +57,12 @@ Phone / Bluetooth controller
 |---|---|---|
 | Bluetooth TX to STM32 RX | USART1 RX | PA10 |
 | STM32 TX to Bluetooth RX | USART1 TX | PA9 |
-| Right-motor PWM | TIM3 channel 3 | PB0 |
-| Left-motor PWM | TIM3 channel 4 | PB1 |
-| Left-motor direction input 1 | GPIO output | PA7 |
-| Left-motor direction input 2 | GPIO output | PA6 |
-| Right-motor direction input 1 | GPIO output | PB4 |
-| Right-motor direction input 2 | GPIO output | PB5 |
+| Right-side motor-pair PWM | TIM3 channel 3 | PB0 |
+| Left-side motor-pair PWM | TIM3 channel 4 | PB1 |
+| Left-side motor-pair direction input 1 | GPIO output | PA7 |
+| Left-side motor-pair direction input 2 | GPIO output | PA6 |
+| Right-side motor-pair direction input 1 | GPIO output | PB4 |
+| Right-side motor-pair direction input 2 | GPIO output | PB5 |
 
 The project configures USART1 at **9600 baud**, with 8 data bits, no parity, and one stop bit.
 
@@ -77,7 +78,7 @@ TIM3 generates PWM on channels 3 and 4.
 | Approximate PWM frequency | 15.24 kHz |
 | Valid compare range | 0-209 |
 
-Both motors currently use the same speed value. A compare value of `0` stops PWM output, while `209` represents the maximum configured duty cycle.
+Both motor pairs currently use the same speed value. Each PWM channel controls the two motors on one side of the vehicle. A compare value of `0` stops PWM output, while `209` represents the maximum configured duty cycle.
 
 ## Firmware structure
 
@@ -143,7 +144,7 @@ s<newline>
 
 ## Motor direction logic
 
-| Movement | Right motor | Left motor |
+| Movement | Right-side motor pair | Left-side motor pair |
 |---|---|---|
 | Forward | Forward | Forward |
 | Backward | Backward | Backward |
@@ -151,7 +152,7 @@ s<newline>
 | Left | Forward | Backward |
 | Stop | PWM compare set to 0 | PWM compare set to 0 |
 
-The current left/right functions perform an in-place turn by driving the motors in opposite directions.
+The current left/right functions perform an in-place turn by driving the two motors on one side opposite to the two motors on the other side.
 
 ## How the command flow works
 
@@ -181,7 +182,7 @@ The current left/right functions perform an in-place turn by driving the motors 
 - Commands require a carriage return or newline before they are executed.
 - The command letters do not yet match the conventional direction initials.
 - Motor speed is fixed at the maximum compare value for every movement command.
-- Both motors always receive the same PWM compare value.
+- Both side motor pairs always receive the same PWM compare value.
 - Speed values are not clamped inside `set_speed()`.
 - There is no communication-loss timeout; the car continues its last command if Bluetooth disconnects.
 - Unknown commands do not automatically stop the motors.
@@ -196,7 +197,7 @@ The current left/right functions perform an in-place turn by driving the motors 
 - Clamp PWM values to the valid 0-209 range
 - Add a Bluetooth communication timeout that automatically stops the car
 - Stop the car when an invalid command is received
-- Add independent left/right motor speed control
+- Add independent left/right motor-pair speed control
 - Add acceleration and deceleration ramps
 - Add obstacle detection using ultrasonic or time-of-flight sensors
 - Add battery-voltage monitoring
@@ -204,7 +205,7 @@ The current left/right functions perform an in-place turn by driving the motors 
 
 ## Safety notes
 
-- Use a motor driver rated for the motors' normal and stall current.
+- Use a motor driver whose per-channel rating safely supports the combined normal and stall current of the two motors connected to that channel.
 - Use a suitable motor power supply and fuse.
 - Keep high-current motor wiring away from the STM32 signal wiring.
 - Ensure that all connected modules share a common ground where required.
@@ -221,7 +222,7 @@ This project demonstrates:
 - Interrupt-driven UART communication
 - Buffered command parsing
 - Separation of hardware-control modules
-- Differential-drive motion control
+- Four-motor differential-drive motion control
 
 ## Author
 
