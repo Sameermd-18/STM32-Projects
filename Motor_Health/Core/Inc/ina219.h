@@ -23,9 +23,11 @@
 #define	INA219_CURRENT_LSB		0.0001f		//100 uA/bit
 #define	INA219_POWER_LSB		0.002f		//2 mW/bit
 
-void INA219_Init(I2C_HandleTypeDef *hi2c);
+//void INA219_Init(I2C_HandleTypeDef *hi2c);
 float INA219_ReadVoltage(I2C_HandleTypeDef *hi2c);
 float INA219_ReadCurrent(I2C_HandleTypeDef *hi2c);
 float INA219_ReadPower(I2C_HandleTypeDef *hi2c);
 
+HAL_StatusTypeDef INA219_Init(I2C_HandleTypeDef *hi2c);
+void INA219_Verify(I2C_HandleTypeDef *hi2c);
 #endif /* INC_INA219_H_ */

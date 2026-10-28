@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "ina219.h"
 #include "ntc.h"
+#include "math.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,6 +34,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define FAULT_OVERLOAD  (1U << 0)
+#define FAULT_STALL     (1U << 1)
+#define FAULT_LOW_VOLT  (1U << 2)
+#define FAULT_HIGH_TEMP (1U << 3)
+#define FAULT_SENSOR    (1U << 4)
 
 /* USER CODE END PD */
 
@@ -57,6 +64,10 @@ osThreadId canTaskHandle;
 osThreadId motorTaskHandle;
 /* USER CODE BEGIN PV */
 
+/* CAN status: 0 = normal, 1 = possible overload */
+volatile uint8_t faultFlags = 0;
+
+volatile uint8_t motorDutyPercent = 50;
 extern I2C_HandleTypeDef hi2c1;
 extern ADC_HandleTypeDef hadc1;
 HAL_StatusTypeDef status;
@@ -81,7 +92,16 @@ HAL_StatusTypeDef status;
 	  } SensorData_t;
 
 	  QueueHandle_t sensorQueue;
+	  QueueHandle_t faultQueue;
 
+	  typedef enum
+	  {
+	      MOTOR_OFF = 0,
+	      MOTOR_STARTING,
+	      MOTOR_RUNNING
+	  } MotorState_t;
+
+	  volatile MotorState_t motorState = MOTOR_OFF;
 
 /* USER CODE END PV */
 
@@ -174,7 +194,12 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   sensorQueue = xQueueCreate(1, sizeof(SensorData_t));
+  faultQueue  = xQueueCreate(1, sizeof(SensorData_t));
 
+  if (sensorQueue == NULL || faultQueue == NULL)
+  {
+      Error_Handler();
+  }
   /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
 
@@ -400,7 +425,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 65535;
+  htim2.Init.Period = 65534;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
@@ -532,32 +557,48 @@ static void MX_GPIO_Init(void)
 void SensorTask(void const * argument)
 {
   /* USER CODE BEGIN 5 */
-	extern TIM_HandleTypeDef htim3;
 	HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
-	int16_t lastCount= (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+	int16_t lastCount = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+	TickType_t lastSampleTick = xTaskGetTickCount();
+	uint8_t verifyCnt = 0;
 
-	  INA219_Init(&hi2c1);   // one-time setup
-  /* Infinite loop */
+	INA219_Init(&hi2c1);   // one-time setup
+
   for(;;)
   {
 	  osDelay(100);
-	     int16_t currentCount = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
-	     int16_t delta = currentCount - lastCount;
-	     lastCount = currentCount;
 
-	      rpm = (delta/3120.0f)*(60.0f/0.1f);
-	      if(delta>0) direction = 1;					//Forward
-	      else if (delta<0) direction = -1;				//Backward
-	      else direction = 0;							//Stopped
+	  int16_t currentCount = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+	  TickType_t now = xTaskGetTickCount();
+	  TickType_t elapsedTicks = now - lastSampleTick;
+	  int16_t delta = (int16_t)(currentCount - lastCount);
 
-	      	  Voltage = INA219_ReadVoltage(&hi2c1);
-	          current = INA219_ReadCurrent(&hi2c1);
-	          Power   = INA219_ReadPower(&hi2c1);
+	  lastCount = currentCount;
+	  lastSampleTick = now;
 
-	          temperature = NTC_ReadTemperature(&hadc1);
+	  if (elapsedTicks > 0)
+	  {
+	      float elapsedSeconds = (float)elapsedTicks / (float)configTICK_RATE_HZ;
+	      rpm = ((float)delta * 60.0f) / (3120.0f * elapsedSeconds);
+	  }
 
-	          SensorData_t sensorData = { rpm, current, Voltage, temperature };
-	          xQueueOverwrite(sensorQueue, &sensorData);
+	  if (delta > 0)      direction = 1;
+	  else if (delta < 0) direction = -1;
+	  else                direction = 0;
+
+	  if (++verifyCnt >= 10) { verifyCnt = 0; INA219_Verify(&hi2c1); }
+
+	  Voltage = INA219_ReadVoltage(&hi2c1);
+	  current = INA219_ReadCurrent(&hi2c1);
+	  Power   = INA219_ReadPower(&hi2c1);
+
+	  temperature = NTC_ReadTemperature(&hadc1);
+
+	  SensorData_t sensorData = { rpm, current, Voltage, temperature };
+	  xQueueOverwrite(sensorQueue, &sensorData);
+	  xQueueOverwrite(faultQueue, &sensorData);
+
+
   }
   /* USER CODE END 5 */
 }
@@ -569,17 +610,273 @@ void SensorTask(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_FaultTask */
-void FaultTask(void const * argument)
+void FaultTask(void const *argument)
 {
-  /* USER CODE BEGIN FaultTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(150);
-  }
-  /* USER CODE END FaultTask */
-}
+    SensorData_t sample;
 
+    uint8_t previousDuty = 0;
+    TickType_t settlingStarted = 0;
+    TickType_t overloadStarted = 0;
+    TickType_t recoveryStarted = 0;
+    TickType_t stallStarted = 0;
+    TickType_t lowVoltStarted = 0;
+    TickType_t highTempStarted = 0;
+    TickType_t validStarted = 0;
+
+    float filteredCurrent = 0.0f;
+
+    for (;;)
+    {
+    	if (xQueueReceive(faultQueue, &sample,
+    	                  pdMS_TO_TICKS(1000)) != pdTRUE)
+    	{
+    	    /* SensorTask stopped producing samples. */
+    	    faultFlags = FAULT_SENSOR;
+    	    validStarted = 0;
+    	    overloadStarted = 0;
+    	    recoveryStarted = 0;
+    	    stallStarted = 0;
+    	    lowVoltStarted = 0;
+    	    highTempStarted = 0;
+    	    filteredCurrent = 0.0f;
+    	    continue;
+    	}
+
+        uint8_t duty = motorDutyPercent;
+        TickType_t now = xTaskGetTickCount();
+        uint8_t flags = faultFlags;
+
+        uint8_t invalid =
+            !isfinite(sample.rpm) ||
+            !isfinite(sample.current) ||
+            !isfinite(sample.voltage) ||
+            !isfinite(sample.temperature) ||
+            sample.voltage < 0.0f ||
+            sample.voltage > 9.0f ||
+            sample.current < -0.5f ||
+            sample.temperature < -20.0f ||
+            sample.temperature > 120.0f;
+
+        if (invalid)
+        {
+            /* One invalid sample immediately makes readings untrusted. */
+            faultFlags = FAULT_SENSOR;
+            validStarted = 0;
+            overloadStarted = 0;
+            recoveryStarted = 0;
+            stallStarted = 0;
+            lowVoltStarted = 0;
+            highTempStarted = 0;
+            filteredCurrent = 0.0f;
+            continue;
+        }
+
+        if (flags & FAULT_SENSOR)
+        {
+            /* Require 1 second of uninterrupted valid readings. */
+            if (validStarted == 0)
+            {
+                validStarted = now;
+                continue;
+            }
+
+            if ((TickType_t)(now - validStarted) <
+                pdMS_TO_TICKS(1000))
+            {
+                continue;
+            }
+
+            faultFlags = 0;
+            flags = 0;
+            validStarted = 0;
+
+            /* Restart startup settling after sensor recovery. */
+            settlingStarted = now;
+            motorState = (duty == 0) ? MOTOR_OFF : MOTOR_STARTING;
+            previousDuty = duty;
+            filteredCurrent = sample.current;
+
+            overloadStarted = 0;
+            recoveryStarted = 0;
+            stallStarted = 0;
+            lowVoltStarted = 0;
+            highTempStarted = 0;
+            continue;
+        }
+
+        validStarted = 0;
+
+        if (duty == 0)
+        {
+            motorState = MOTOR_OFF;
+            faultFlags = 0;
+            overloadStarted = 0;
+            recoveryStarted = 0;
+            stallStarted = 0;
+            lowVoltStarted = 0;
+            highTempStarted = 0;
+            filteredCurrent = 0.0f;
+            previousDuty = duty;
+            continue;
+        }
+
+        if (duty != previousDuty)
+        {
+            settlingStarted = now;
+            motorState = MOTOR_STARTING;
+            flags = 0;
+            overloadStarted = 0;
+            recoveryStarted = 0;
+            stallStarted = 0;
+            filteredCurrent = sample.current;
+        }
+        else
+        {
+            filteredCurrent =
+                0.7f * filteredCurrent + 0.3f * sample.current;
+        }
+
+        if ((TickType_t)(now - settlingStarted) >=
+            pdMS_TO_TICKS(2000))
+        {
+            motorState = MOTOR_RUNNING;
+        }
+
+        /* Provisional 2-cell low-supply-voltage warning. */
+        if (sample.voltage < 6.4f)
+        {
+            if (lowVoltStarted == 0)
+                lowVoltStarted = now;
+            else if ((TickType_t)(now - lowVoltStarted) >=
+                     pdMS_TO_TICKS(2000))
+                flags |= FAULT_LOW_VOLT;
+        }
+        else
+        {
+            lowVoltStarted = 0;
+
+            if (sample.voltage > 6.6f)
+                flags &= (uint8_t)~FAULT_LOW_VOLT;
+        }
+
+        /* Provisional casing-temperature warning. */
+        if (sample.temperature > 60.0f)
+        {
+            if (highTempStarted == 0)
+                highTempStarted = now;
+            else if ((TickType_t)(now - highTempStarted) >=
+                     pdMS_TO_TICKS(2000))
+                flags |= FAULT_HIGH_TEMP;
+        }
+        else
+        {
+            highTempStarted = 0;
+
+            if (sample.temperature < 55.0f)
+                flags &= (uint8_t)~FAULT_HIGH_TEMP;
+        }
+
+        if (motorState != MOTOR_RUNNING)
+        {
+            flags &= (uint8_t)~(FAULT_OVERLOAD | FAULT_STALL);
+            overloadStarted = 0;
+            recoveryStarted = 0;
+            stallStarted = 0;
+        }
+        else
+        {
+            /* Measured near-stall rule at 50% duty. */
+            if (duty == 50 &&
+                sample.rpm < 20.0f &&
+                filteredCurrent > 0.45f)
+            {
+                if (stallStarted == 0)
+                    stallStarted = now;
+                else if ((TickType_t)(now - stallStarted) >=
+                         pdMS_TO_TICKS(500))
+                    flags |= FAULT_STALL;
+            }
+            else
+            {
+                stallStarted = 0;
+
+                if (sample.rpm > 40.0f || duty != 50)
+                    flags &= (uint8_t)~FAULT_STALL;
+            }
+
+            float tripRpm = 0.0f;
+            float tripCurrent = 0.0f;
+            float clearRpm = 0.0f;
+            float clearCurrent = 0.0f;
+            uint8_t supportedDuty = 1;
+
+            if (duty == 50)
+            {
+                tripRpm = 85.0f;
+                tripCurrent = 0.34f;
+                clearRpm = 90.0f;
+                clearCurrent = 0.32f;
+            }
+            else if (duty == 75)
+            {
+                tripRpm = 112.0f;
+                tripCurrent = 0.33f;
+                clearRpm = 116.0f;
+                clearCurrent = 0.32f;
+            }
+            else
+            {
+                supportedDuty = 0;
+            }
+
+            if (!supportedDuty || (flags & FAULT_STALL))
+            {
+                flags &= (uint8_t)~FAULT_OVERLOAD;
+                overloadStarted = 0;
+                recoveryStarted = 0;
+            }
+            else if (!(flags & FAULT_OVERLOAD))
+            {
+                if (sample.rpm < tripRpm &&
+                    sample.current > tripCurrent)
+                {
+                    if (overloadStarted == 0)
+                        overloadStarted = now;
+                    else if ((TickType_t)(now - overloadStarted) >=
+                             pdMS_TO_TICKS(1000))
+                        flags |= FAULT_OVERLOAD;
+                }
+                else
+                {
+                    overloadStarted = 0;
+                }
+            }
+            else
+            {
+                if (sample.rpm > clearRpm &&
+                    sample.current < clearCurrent)
+                {
+                    if (recoveryStarted == 0)
+                        recoveryStarted = now;
+                    else if ((TickType_t)(now - recoveryStarted) >=
+                             pdMS_TO_TICKS(1000))
+                    {
+                        flags &= (uint8_t)~FAULT_OVERLOAD;
+                        overloadStarted = 0;
+                        recoveryStarted = 0;
+                    }
+                }
+                else
+                {
+                    recoveryStarted = 0;
+                }
+            }
+        }
+
+        faultFlags = flags;
+        previousDuty = duty;
+    }
+}
 /* USER CODE BEGIN Header_CANTask */
 /**
 * @brief Function implementing the canTask thread.
@@ -587,58 +884,107 @@ void FaultTask(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_CANTask */
-void CANTask(void const * argument)
+void CANTask(void const *argument)
 {
-  /* USER CODE BEGIN CANTask */
-  /* Infinite loop */
+    CAN_FilterTypeDef filter = {0};
+    filter.FilterBank = 0;
+    filter.FilterMode = CAN_FILTERMODE_IDMASK;
+    filter.FilterScale = CAN_FILTERSCALE_32BIT;
+    filter.FilterIdHigh = 0;
+    filter.FilterIdLow = 0;
+    filter.FilterMaskIdHigh = 0;
+    filter.FilterMaskIdLow = 0;
+    filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+    filter.FilterActivation = ENABLE;
 
-	    CAN_FilterTypeDef filter;
-	    filter.FilterBank = 0;
-	    filter.FilterMode = CAN_FILTERMODE_IDMASK;
-	    filter.FilterScale = CAN_FILTERSCALE_32BIT;
-	    filter.FilterIdHigh = 0x0000;
-	    filter.FilterIdLow = 0x0000;
-	    filter.FilterMaskIdHigh = 0x0000;
-	    filter.FilterMaskIdLow = 0x0000;
-	    filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
-	    filter.FilterActivation = ENABLE;
-	    HAL_CAN_ConfigFilter(&hcan, &filter);
-	    HAL_CAN_Start(&hcan);
+    if (HAL_CAN_ConfigFilter(&hcan, &filter) != HAL_OK)
+        Error_Handler();
 
-	    CAN_TxHeaderTypeDef txHeader;
-	    txHeader.StdId = 0x100;
-	    txHeader.IDE = CAN_ID_STD;
-	    txHeader.RTR = CAN_RTR_DATA;
-	    txHeader.DLC = 8;
+    if (HAL_CAN_Start(&hcan) != HAL_OK)
+        Error_Handler();
 
-	    uint8_t txData[8];
-	    uint32_t txMailbox;
-	    SensorData_t data;
+    CAN_TxHeaderTypeDef sensorHeader = {0};
+    sensorHeader.StdId = 0x100;
+    sensorHeader.IDE = CAN_ID_STD;
+    sensorHeader.RTR = CAN_RTR_DATA;
+    sensorHeader.DLC = 8;
+    sensorHeader.TransmitGlobalTime = DISABLE;
 
-	    for(;;)
-	    {
-	      if (xQueueReceive(sensorQueue, &data, portMAX_DELAY) == pdTRUE)
-	      {
-	        int16_t rpmScaled = (int16_t)(data.rpm * 10);
-	        int16_t currentScaled = (int16_t)(data.current * 1000);
-	        int16_t voltageScaled = (int16_t)(data.voltage * 100);
-	        int16_t tempScaled = (int16_t)(data.temperature * 10);
+    CAN_TxHeaderTypeDef statusHeader = {0};
+    statusHeader.StdId = 0x101;
+    statusHeader.IDE = CAN_ID_STD;
+    statusHeader.RTR = CAN_RTR_DATA;
+    statusHeader.DLC = 3;
+    statusHeader.TransmitGlobalTime = DISABLE;
 
-	        txData[0] = (rpmScaled >> 8) & 0xFF;
-	        txData[1] = rpmScaled & 0xFF;
-	        txData[2] = (currentScaled >> 8) & 0xFF;
-	        txData[3] = currentScaled & 0xFF;
-	        txData[4] = (voltageScaled >> 8) & 0xFF;
-	        txData[5] = voltageScaled & 0xFF;
-	        txData[6] = (tempScaled >> 8) & 0xFF;
-	        txData[7] = tempScaled & 0xFF;
+    uint32_t txMailbox;
+    SensorData_t data;
+    TickType_t lastStatusTick = 0;
 
-	        HAL_CAN_AddTxMessage(&hcan, &txHeader, txData, &txMailbox);
-	      }
-	      osDelay(100);
+    for (;;)
+    {
+        /* SensorTask normally supplies a reading about every 100 ms. */
+        if (xQueueReceive(sensorQueue, &data,
+                          pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            /* Do not convert NaN/infinite readings to integer CAN data. */
+        	if (isfinite(data.rpm) &&
+        	    isfinite(data.current) &&
+        	    isfinite(data.voltage) &&
+        	    isfinite(data.temperature) &&
+        	    data.voltage >= 0.0f &&
+        	    data.voltage <= 9.0f)
+        	{
+                int16_t rpmScaled =
+                    (int16_t)(data.rpm * 10.0f);
+                int16_t currentScaled =
+                    (int16_t)(data.current * 1000.0f);
+                int16_t voltageScaled =
+                    (int16_t)(data.voltage * 100.0f);
+                int16_t tempScaled =
+                    (int16_t)(data.temperature * 10.0f);
 
-  }
-  /* USER CODE END CANTask */
+                uint8_t sensorData[8] = {
+                    (uint8_t)((rpmScaled >> 8) & 0xFF),
+                    (uint8_t)(rpmScaled & 0xFF),
+                    (uint8_t)((currentScaled >> 8) & 0xFF),
+                    (uint8_t)(currentScaled & 0xFF),
+                    (uint8_t)((voltageScaled >> 8) & 0xFF),
+                    (uint8_t)(voltageScaled & 0xFF),
+                    (uint8_t)((tempScaled >> 8) & 0xFF),
+                    (uint8_t)(tempScaled & 0xFF)
+                };
+
+                if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) > 0)
+                {
+                    HAL_CAN_AddTxMessage(&hcan, &sensorHeader,
+                                         sensorData, &txMailbox);
+                }
+            }
+        }
+
+        /* Report fault status even if a sensor reading was invalid. */
+        TickType_t now = xTaskGetTickCount();
+
+        if ((TickType_t)(now - lastStatusTick) >=
+            pdMS_TO_TICKS(500))
+        {
+            uint8_t duty = motorDutyPercent;
+
+            uint8_t statusData[3] = {
+                faultFlags,
+                duty,
+                (duty == 50 || duty == 75) ? 1U : 0U
+            };
+
+            if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) > 0 &&
+                HAL_CAN_AddTxMessage(&hcan, &statusHeader,
+                                     statusData, &txMailbox) == HAL_OK)
+            {
+                lastStatusTick = now;
+            }
+        }
+    }
 }
 
 /* USER CODE BEGIN Header_MotorTask */
@@ -656,13 +1002,14 @@ void MotorTask(void const * argument)
 	HAL_GPIO_WritePin(IN1_GPIO_Port, IN1_Pin,GPIO_PIN_SET);
 	HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
 
-	uint8_t dutyPercent = 75;
+
 	uint32_t period = __HAL_TIM_GET_AUTORELOAD(&htim2);
 
   /* Infinite loop */
   for(;;)
   {
-	  uint32_t compare = (dutyPercent * period)/100;
+	  uint32_t compare =
+	      ((uint32_t)motorDutyPercent * (period + 1U)) / 100U;
 	  __HAL_TIM_SET_COMPARE(&htim2,TIM_CHANNEL_1,compare);
 
     osDelay(100);
